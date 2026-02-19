@@ -100,12 +100,46 @@ class _TextRecognitionPageState extends State<TextRecognitionPage> {
       _showError('Error picking image: $e');
     }
   }
+  String _removeDuplicateLines(String text) {
+    final seen = <String>{};
+    final buffer = StringBuffer();
+
+    for (final line in text.split('\n')) {
+      final clean = line.trim();
+      if (clean.isNotEmpty && !seen.contains(clean)) {
+        seen.add(clean);
+        buffer.writeln(clean);
+      }
+    }
+    return buffer.toString();
+  }
+
+  String _normalizeOCR(String text) {
+    return _removeDuplicateLines(text)
+        .replaceAll(';', ':')
+        .replaceAll('।', ':')
+        .replaceAll('|', 'I')
+
+    // ID → NID normalization
+        .replaceAll(RegExp(r'\bID\s*NO\b', caseSensitive: false), 'NID NO')
+        .replaceAll(RegExp(r'\bI0\s*NO\b', caseSensitive: false), 'NID NO')
+        .replaceAll(RegExp(r'\bD\s*NO\b', caseSensitive: false), 'NID NO')
+
+    // Bengali label normalization
+        .replaceAll(RegExp(r'পিভা|পিতা\s*;'), 'পিতা:')
+        .replaceAll(RegExp(r'মতা|মাতা\s*;'), 'মাতা:')
+
+    // remove garbage
+        .replaceAll(RegExp(r'[^\x00-\x7F\u0980-\u09FF:\n ]'), '')
+        .replaceAll(RegExp(r'[ ]{2,}'), ' ')
+        .trim();
+  }
+
 
   Future<void> _recognizeText(String imagePath) async {
     try {
       final inputImage = InputImage.fromFilePath(imagePath);
 
-      // Run both recognizers in parallel
       final results = await Future.wait([
         _latinRecognizer.processImage(inputImage),
         _devanagariRecognizer.processImage(inputImage),
@@ -114,29 +148,31 @@ class _TextRecognitionPageState extends State<TextRecognitionPage> {
       final latinText = results[0].text;
       final bengaliText = results[1].text;
 
-      // Merge: Bengali text first, then Latin (mirrors card layout)
       final String combinedText = '$bengaliText\n$latinText';
-      log(combinedText);
 
-      final nidData = _parseNIDCard(combinedText);
+      // ⭐ NEW → normalize before parsing
+      final normalized = _normalizeOCR(combinedText);
+
+      log(normalized);
+
+      final nidData = _parseNIDCard(normalized);
 
       setState(() {
         _nidData = nidData;
         _isProcessing = false;
       });
 
-      if (combinedText.trim().isEmpty) {
+      if (normalized.trim().isEmpty) {
         _showError('No text found in the image');
       } else if (!nidData.isNIDCard) {
         _showMessage('Note: This may not be a Bangladesh NID card', isWarning: true);
       }
     } catch (e) {
-      setState(() {
-        _isProcessing = false;
-      });
+      setState(() => _isProcessing = false);
       _showError('Error recognizing text: $e');
     }
   }
+
 
   NIDCardData _parseNIDCard(String text) {
     log(text);
@@ -158,15 +194,27 @@ class _TextRecognitionPageState extends State<TextRecognitionPage> {
     // Case 1: "Name: VALUE"
     // Case 2: "Name\nVALUE"
     // Typo handling: "Narme", "Nam"
-    final nameRegex = RegExp(r'(?:Name|Narme|Nam)[:\s]*([A-Z\s.]+?)(?=\s*Date|\s*NID|\s*Father|\s*Mother|$)',
-        caseSensitive: false, multiLine: true);
+    // 1. Updated Name Regex to handle slashes "/" and non-word noise from OCR
+    // 1. Added "-" to the character set to allow names like AL-AMIN
+    final nameRegex = RegExp(
+        r'(?:Name|Narme|Nam)[^a-zA-Z]*([A-Z\s.\-]+)',
+        caseSensitive: false,
+        multiLine: true
+    );
+
     final nameMatch = nameRegex.firstMatch(text);
     if (nameMatch != null) {
-      name = nameMatch.group(1)?.trim();
-      // Remove "Date of Birth" remnants if regex failed to stop perfectly
-      if (name != null && name.toLowerCase().contains("date of birth")) {
-        final split = name.toLowerCase().split("date of birth");
-        if (split.isNotEmpty) name = split[0].trim();
+      // Extract the raw match
+      String rawName = nameMatch.group(1) ?? "";
+
+      // 2. Clean up leading non-alphabet noise (like "/ " or "- ")
+      // but we only want to strip them if they are at the very START
+      name = rawName.replaceFirst(RegExp(r'^[^a-zA-Z]+'), '').trim();
+
+      // 3. Prevent overflow into "Date of Birth"
+      // Since we are now more aggressive, we must ensure we don't swallow the next field
+      if (name.toLowerCase().contains("date")) {
+        name = name.split(RegExp(r'date', caseSensitive: false))[0].trim();
       }
     }
 
@@ -235,7 +283,7 @@ class _TextRecognitionPageState extends State<TextRecognitionPage> {
     }
 
     // Extract Mother's Name (in Bengali text pattern)
-    final motherRegex = RegExp(r'(?:মাতা|আতা)[:\s]*(.+?)(?=Date|NID|\n|$)', multiLine: true);
+    final motherRegex = RegExp(r'(?:মাতা|আতা|মতা)[:\s]*(.+?)(?=Date|NID|\n|$)', multiLine: true);
     final motherMatch = motherRegex.firstMatch(text);
     if (motherMatch != null) {
       motherName = motherMatch.group(1)?.trim();
